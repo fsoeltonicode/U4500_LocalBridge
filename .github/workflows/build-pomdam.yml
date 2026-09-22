@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - build/pomdam-u4500-win64
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
