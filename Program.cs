@@ -2,9 +2,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
-using System.Threading;
 using System.Windows.Forms;
-using System.Runtime.InteropServices;
 using Fleck;
 using DPUruNet;
 
@@ -12,9 +10,14 @@ namespace U4500_LocalBridge
 {
     class Program
     {
+        private const int Port = 8182;
+        private const int MaxImageDimension = 4096;
+
         static IWebSocketConnection? currentSocket;
+        static IWebSocketConnection? captureSocket;
         static Reader? currentReader;
         static Form hiddenForm;
+        static bool captureInProgress;
 
         [STAThread]
         static void Main(string[] args)
@@ -25,102 +28,113 @@ namespace U4500_LocalBridge
             Console.WriteLine("Memulai server...");
 
             hiddenForm = new Form();
-            IntPtr handle = hiddenForm.Handle; // Memaksa pembuatan HWND agar message loop berjalan
+            _ = hiddenForm.Handle;
 
-            var server = new WebSocketServer("ws://0.0.0.0:8182");
+            var server = new WebSocketServer($"ws://0.0.0.0:{Port}");
             server.Start(socket =>
             {
-                socket.OnOpen = () => 
+                socket.OnOpen = () =>
                 {
                     Console.WriteLine("🌐 Web Client terkoneksi!");
                     currentSocket = socket;
                 };
-                socket.OnClose = () => 
+
+                socket.OnClose = () =>
                 {
                     Console.WriteLine("❌ Web Client terputus!");
-                    currentSocket = null;
-                    if (currentReader != null) {
-                        try { 
-                            hiddenForm.BeginInvoke((MethodInvoker)delegate {
-                                try { currentReader.CancelCapture(); } catch { }
-                            });
-                        } catch { }
+
+                    if (ReferenceEquals(currentSocket, socket))
+                    {
+                        currentSocket = null;
                     }
+
+                    if (ReferenceEquals(captureSocket, socket))
+                    {
+                        captureSocket = null;
+                        captureInProgress = false;
+                    }
+
+                    CancelReaderCapture();
                 };
+
                 socket.OnMessage = message =>
                 {
                     Console.WriteLine($"📩 Pesan diterima dari Web: {message}");
+
                     if (message == "CHECK_STATUS")
                     {
-                        hiddenForm.BeginInvoke((MethodInvoker)delegate {
-                            CheckDeviceStatus(socket);
-                        });
+                        hiddenForm.BeginInvoke((MethodInvoker)(() => CheckDeviceStatus(socket)));
                     }
                     else if (message == "CAPTURE_FINGER")
                     {
-                        hiddenForm.BeginInvoke((MethodInvoker)delegate {
-                            StartCapture(socket);
-                        });
+                        hiddenForm.BeginInvoke((MethodInvoker)(() => StartCapture(socket)));
                     }
                 };
             });
 
-            Console.WriteLine("✅ WebSocket Server berjalan di ws://localhost:8182");
+            Console.WriteLine($"✅ WebSocket Server berjalan di ws://localhost:{Port}");
             Console.WriteLine("⏳ Jangan tutup jendela ini selama aplikasi SIM dipakai.");
             Console.WriteLine("Tekan Ctrl+C atau tutup jendela ini untuk keluar...");
-            
+
             Application.Run();
 
-            if (currentReader != null)
-            {
-                currentReader.Dispose();
-            }
+            CancelReaderCapture();
+            currentReader?.Dispose();
         }
 
         static void CheckDeviceStatus(IWebSocketConnection socket)
         {
-            try 
+            try
             {
                 ReaderCollection readers = ReaderCollection.GetReaders();
-                if (readers.Count > 0)
+
+                if (readers.Count == 0)
                 {
-                    currentReader = readers[0];
-                    socket.Send("STATUS:READY");
-                    Console.WriteLine($"🔍 Device ditemukan: {currentReader.Description.Name}");
-                }
-                else
-                {
-                    socket.Send("STATUS:ERROR|Scanner U.are.U 4500 tidak terdeteksi di USB");
+                    currentReader = null;
+                    SafeSend(socket, "STATUS:ERROR|Scanner U.are.U 4500 tidak terdeteksi di USB");
                     Console.WriteLine("⚠️ Device tidak ditemukan.");
+                    return;
                 }
+
+                currentReader = readers[0];
+                SafeSend(socket, "STATUS:READY");
+                Console.WriteLine($"🔍 Device ditemukan: {currentReader.Description.Name}");
             }
             catch (Exception ex)
             {
-                socket.Send($"STATUS:ERROR|{ex.Message}");
+                SafeSend(socket, $"STATUS:ERROR|{ex.Message}");
+                Console.WriteLine($"❌ CheckDeviceStatus: {ex.Message}");
             }
         }
 
         static void StartCapture(IWebSocketConnection socket)
         {
+            if (captureInProgress)
+            {
+                SafeSend(socket, "ERROR:Scanner sedang memproses scan sebelumnya");
+                return;
+            }
+
             if (currentReader == null)
             {
-                socket.Send("ERROR:Device belum siap");
+                SafeSend(socket, "ERROR:Device belum siap");
                 Console.WriteLine("⚠️ StartCapture gagal: currentReader null.");
                 return;
             }
 
             Console.WriteLine("🔄 Memulai proses StartCapture...");
+
             try
             {
-                try { 
-                    currentReader.CancelCapture(); 
-                } catch { }
+                CancelReaderCapture();
 
-                Constants.ResultCode result = currentReader.Open(Constants.CapturePriority.DP_PRIORITY_COOPERATIVE);
-                if (result != Constants.ResultCode.DP_SUCCESS && result != Constants.ResultCode.DP_DEVICE_BUSY)
+                Constants.ResultCode openResult =
+                    currentReader.Open(Constants.CapturePriority.DP_PRIORITY_COOPERATIVE);
+
+                if (openResult != Constants.ResultCode.DP_SUCCESS)
                 {
-                    string err = $"ERROR:Gagal membuka port scanner. Kode: {result}";
-                    socket.Send(err);
+                    string err = $"ERROR:Gagal membuka scanner. Kode: {openResult}";
+                    SafeSend(socket, err);
                     Console.WriteLine($"❌ {err}");
                     return;
                 }
@@ -128,118 +142,246 @@ namespace U4500_LocalBridge
                 currentReader.On_Captured -= new Reader.CaptureCallback(OnCaptured);
                 currentReader.On_Captured += new Reader.CaptureCallback(OnCaptured);
 
-                socket.Send("INFO:SILAKAN TEMPELKAN JARI KE ALAT");
+                captureSocket = socket;
+                captureInProgress = true;
+
+                SafeSend(socket, "INFO:SILAKAN TEMPELKAN JARI KE ALAT");
                 Console.WriteLine("💡 Lampu scanner menyala. Menunggu jari ditempel...");
 
-                Constants.ResultCode captureResult = currentReader.CaptureAsync(Constants.Formats.Fid.ANSI, Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT, currentReader.Capabilities.Resolutions[0]);
-                
+                Constants.ResultCode captureResult = currentReader.CaptureAsync(
+                    Constants.Formats.Fid.ANSI,
+                    Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
+                    currentReader.Capabilities.Resolutions[0]);
+
                 if (captureResult == Constants.ResultCode.DP_SUCCESS)
                 {
-                    Console.WriteLine("✅ CaptureAsync berjalan! Menunggu interupsi USB...");
+                    Console.WriteLine("✅ CaptureAsync berjalan! Menunggu hasil capture...");
                 }
                 else
                 {
+                    captureInProgress = false;
+                    captureSocket = null;
+
                     string err = $"ERROR:Gagal memulai scan async. Kode: {captureResult}";
-                    socket.Send(err);
+                    SafeSend(socket, err);
                     Console.WriteLine($"❌ {err}");
                 }
             }
             catch (Exception ex)
             {
+                captureInProgress = false;
+                captureSocket = null;
+
                 string err = $"ERROR:{ex.Message}";
-                socket.Send(err);
+                SafeSend(socket, err);
                 Console.WriteLine($"❌ Exception di StartCapture: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
         static void OnCaptured(CaptureResult captureResult)
         {
-            if (currentSocket == null) 
+            var socket = captureSocket ?? currentSocket;
+
+            if (socket == null)
             {
-                Console.WriteLine("⚠️ OnCaptured: currentSocket null, batal mengirim.");
+                captureInProgress = false;
+                captureSocket = null;
+                Console.WriteLine("⚠️ OnCaptured: tidak ada WebSocket aktif.");
                 return;
             }
 
-            if (captureResult.Quality != Constants.CaptureQuality.DP_QUALITY_GOOD)
+            try
             {
-                string err = $"ERROR:Kualitas tangkapan buruk atau dibatalkan (Quality={captureResult.Quality})";
-                currentSocket.Send(err);
-                Console.WriteLine($"❌ {err}");
-                return;
-            }
+                Console.WriteLine($"📥 Capture diterima. Quality={captureResult.Quality}");
 
-            if (captureResult.Data != null && captureResult.Data.Views != null && captureResult.Data.Views.Count > 0)
-            {
-                try
+                if (captureResult.Data?.Views == null || captureResult.Data.Views.Count == 0)
                 {
-                    Console.WriteLine($"  Jumlah view sidik jari: {captureResult.Data.Views.Count}");
-                    foreach (var view in captureResult.Data.Views)
+                    SendCaptureError(socket, $"Data/Views kosong (Quality={captureResult.Quality})");
+                    return;
+                }
+
+                // Jangan membuang frame hanya karena flag quality bukan GOOD.
+                // Gambar tetap dikirim ke browser agar operator dapat melihat hasil
+                // capture dan memutuskan apakah perlu melakukan scan ulang.
+                SendInfo(socket, $"CAPTURE QUALITY: {captureResult.Quality}");
+
+                foreach (var view in captureResult.Data.Views)
+                {
+                    try
                     {
-                        Console.WriteLine($"  Membuat Bitmap dari ukuran {view.Width}x{view.Height}...");
-                        Bitmap bmp = CreateBitmap(view.RawImage, view.Width, view.Height);
-                        
-                        Console.WriteLine("  Mengubah Bitmap ke Base64 (PNG)...");
+                        Console.WriteLine(
+                            $"  View {view.Width}x{view.Height}, RawImage={view.RawImage?.Length ?? 0} bytes");
+
+                        using Bitmap bmp = CreateBitmap(view.RawImage, view.Width, view.Height);
                         string base64 = ConvertBitmapToBase64(bmp);
-                        
-                        Console.WriteLine("  Mengirim Base64 ke browser via WebSocket...");
-                        currentSocket.Send($"IMAGE:data:image/png;base64,{base64}");
+
+                        Console.WriteLine($"  Bitmap berhasil dibuat. Base64={base64.Length} chars");
+                        SafeSend(socket, $"IMAGE:data:image/png;base64,{base64}");
                         Console.WriteLine("✅ Gambar sidik jari berhasil dikirim.");
-                        break; 
+
+                        captureInProgress = false;
+                        captureSocket = null;
+                        BeginCancelCapture();
+                        return;
                     }
-                    
-                    hiddenForm.BeginInvoke((MethodInvoker)delegate {
-                        try {
-                            Console.WriteLine("  Mematikan lampu scanner...");
-                            currentReader?.CancelCapture();
-                        } catch { }
-                    });
+                    catch (Exception viewEx)
+                    {
+                        Console.WriteLine($"⚠️ View gagal diproses: {viewEx.Message}");
+                    }
                 }
-                catch (Exception ex)
-                {
-                    string err = $"ERROR:Gagal memproses gambar: {ex.Message}";
-                    currentSocket.Send(err);
-                    Console.WriteLine($"❌ {err}\n{ex.StackTrace}");
-                }
+
+                SendCaptureError(socket, "Tidak ada view sidik jari yang dapat dikonversi menjadi gambar.");
             }
-            else
+            catch (Exception ex)
             {
-                string err = $"ERROR:Gagal menangkap sidik jari (Data/Views null)";
-                currentSocket.Send(err);
-                Console.WriteLine($"❌ {err}");
+                SendCaptureError(socket, $"Gagal memproses gambar: {ex.Message}");
+                Console.WriteLine($"❌ OnCaptured: {ex.Message}\n{ex.StackTrace}");
+            }
+            finally
+            {
+                captureInProgress = false;
+                captureSocket = null;
             }
         }
 
-        static Bitmap CreateBitmap(byte[] bytes, int width, int height)
+        static Bitmap CreateBitmap(byte[]? bytes, int width, int height)
         {
-            byte[] rgbBytes = new byte[bytes.Length * 3];
-            for (int i = 0; i < bytes.Length; i++)
+            if (bytes == null || bytes.Length == 0)
+                throw new InvalidOperationException("RawImage kosong.");
+
+            if (width <= 0 || height <= 0)
+                throw new InvalidOperationException($"Dimensi gambar tidak valid: {width}x{height}.");
+
+            if (width > MaxImageDimension || height > MaxImageDimension)
+                throw new InvalidOperationException($"Dimensi gambar terlalu besar: {width}x{height}.");
+
+            long pixelCountLong = (long)width * height;
+            if (pixelCountLong > int.MaxValue / 3)
+                throw new InvalidOperationException("Ukuran gambar terlalu besar untuk diproses.");
+
+            int pixelCount = (int)pixelCountLong;
+            var grayscale = new byte[pixelCount];
+
+            int copyLength = Math.Min(bytes.Length, grayscale.Length);
+            Buffer.BlockCopy(bytes, 0, grayscale, 0, copyLength);
+
+            if (copyLength < grayscale.Length)
             {
-                rgbBytes[(i * 3)] = bytes[i];
-                rgbBytes[(i * 3) + 1] = bytes[i];
-                rgbBytes[(i * 3) + 2] = bytes[i];
+                Array.Fill(grayscale, (byte)255, copyLength, grayscale.Length - copyLength);
+                Console.WriteLine(
+                    $"⚠️ RawImage lebih kecil dari ukuran piksel yang diharapkan: {bytes.Length} < {grayscale.Length}.");
             }
-            Bitmap bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb);
 
-            BitmapData data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
-
-            for (int i = 0; i < bmp.Height; i++)
+            var rgbBytes = new byte[pixelCount * 3];
+            for (int i = 0; i < grayscale.Length; i++)
             {
-                IntPtr p = new IntPtr(data.Scan0.ToInt64() + data.Stride * i);
-                System.Runtime.InteropServices.Marshal.Copy(rgbBytes, i * bmp.Width * 3, p, bmp.Width * 3);
+                byte value = grayscale[i];
+                int offset = i * 3;
+                rgbBytes[offset] = value;
+                rgbBytes[offset + 1] = value;
+                rgbBytes[offset + 2] = value;
             }
 
-            bmp.UnlockBits(data);
+            var bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+            BitmapData? locked = null;
+
+            try
+            {
+                locked = bmp.LockBits(
+                    new Rectangle(0, 0, bmp.Width, bmp.Height),
+                    ImageLockMode.WriteOnly,
+                    PixelFormat.Format24bppRgb);
+
+                int rowBytes = width * 3;
+
+                for (int y = 0; y < height; y++)
+                {
+                    IntPtr rowPtr = IntPtr.Add(locked.Scan0, y * locked.Stride);
+                    System.Runtime.InteropServices.Marshal.Copy(
+                        rgbBytes,
+                        y * rowBytes,
+                        rowPtr,
+                        rowBytes);
+                }
+            }
+            catch
+            {
+                bmp.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (locked != null)
+                    bmp.UnlockBits(locked);
+            }
 
             return bmp;
         }
 
         static string ConvertBitmapToBase64(Bitmap bitmap)
         {
-            using (MemoryStream ms = new MemoryStream())
+            using var ms = new MemoryStream();
+            bitmap.Save(ms, ImageFormat.Png);
+            return Convert.ToBase64String(ms.ToArray());
+        }
+
+        static void BeginCancelCapture()
+        {
+            try
             {
-                bitmap.Save(ms, ImageFormat.Png);
-                byte[] byteImage = ms.ToArray();
-                return Convert.ToBase64String(byteImage);
+                hiddenForm.BeginInvoke((MethodInvoker)(() =>
+                {
+                    try
+                    {
+                        currentReader?.CancelCapture();
+                        Console.WriteLine("  🛑 Capture dibatalkan setelah hasil diterima.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠️ CancelCapture: {ex.Message}");
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ BeginInvoke CancelCapture: {ex.Message}");
+            }
+        }
+
+        static void CancelReaderCapture()
+        {
+            try
+            {
+                currentReader?.CancelCapture();
+            }
+            catch
+            {
+                // Scanner mungkin sudah idle / tidak sedang capture.
+            }
+
+            captureInProgress = false;
+            captureSocket = null;
+        }
+
+        static void SendInfo(IWebSocketConnection socket, string message) =>
+            SafeSend(socket, $"INFO:{message}");
+
+        static void SendCaptureError(IWebSocketConnection socket, string message)
+        {
+            SafeSend(socket, $"ERROR:{message}");
+            captureInProgress = false;
+            captureSocket = null;
+        }
+
+        static void SafeSend(IWebSocketConnection socket, string message)
+        {
+            try
+            {
+                socket.Send(message);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ WebSocket send gagal: {ex.Message}");
             }
         }
     }
