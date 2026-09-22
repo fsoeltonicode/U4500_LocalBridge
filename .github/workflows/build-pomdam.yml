@@ -1,0 +1,82 @@
+name: Build U4500 LocalBridge Windows
+
+on:
+  push:
+    branches:
+      - build/pomdam-u4500-win64
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore
+        run: dotnet restore U4500_LocalBridge.csproj
+      - name: Publish win-x64 self-contained
+        run: dotnet publish U4500_LocalBridge.csproj -c Release -r win-x64 --self-contained true -p:PublishReadyToRun=false -o publish
+      - name: Add operator launcher
+        shell: pwsh
+        run: |
+          @'
+          @echo off
+          title U.are.U 4500 Local Bridge
+          cd /d "%~dp0"
+          echo ==============================================
+          echo    U.ARE.U 4500 LOCAL BRIDGE
+          echo ==============================================
+          echo.
+          echo WebSocket: ws://localhost:8182
+          echo.
+          U4500_LocalBridge.exe
+          pause
+          '@ | Set-Content -Encoding ASCII publish\Start_U4500_LocalBridge.bat
+      - name: Add deployment notes
+        shell: pwsh
+        run: |
+          @'
+          U4500 LocalBridge - Paket Windows x64
+
+          Isi paket:
+          - U4500_LocalBridge.exe
+          - dependency hasil publish self-contained
+          - DPUruNet.dll
+          - Start_U4500_LocalBridge.bat
+
+          Cara menjalankan:
+          1. Pastikan driver/runtime DigitalPersona U.are.U 4500 yang sesuai sudah terpasang.
+          2. Hubungkan scanner U.are.U 4500 melalui USB.
+          3. Jalankan Start_U4500_LocalBridge.bat.
+          4. Biarkan bridge berjalan selama aplikasi SIM digunakan.
+          5. Buka aplikasi SIM dan pilih DIGITALPERSONA U.ARE.U 4500.
+
+          Bridge:
+          ws://localhost:8182
+
+          Catatan:
+          Paket ini self-contained untuk Windows x64 dan tidak memerlukan .NET 8 Runtime terpisah.
+          Capture fisik tetap harus diuji pada PC Pomdam dengan scanner yang terpasang.
+          '@ | Set-Content -Encoding UTF8 publish\README-POMDAM.txt
+      - name: Smoke-check published files
+        shell: pwsh
+        run: |
+          if (-not (Test-Path publish\U4500_LocalBridge.exe)) { throw "U4500_LocalBridge.exe tidak ditemukan" }
+          if (-not (Test-Path publish\DPUruNet.dll)) { throw "DPUruNet.dll tidak ditemukan" }
+          if (-not (Test-Path publish\Start_U4500_LocalBridge.bat)) { throw "Launcher tidak ditemukan" }
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path publish\* -DestinationPath U4500_LocalBridge_Pomdam_Win64.zip -Force
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: U4500_LocalBridge_Pomdam_Win64
+          path: U4500_LocalBridge_Pomdam_Win64.zip
+          if-no-files-found: error
